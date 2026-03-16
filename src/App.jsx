@@ -1,14 +1,14 @@
 import { useState, useEffect, useRef, useCallback, useMemo, useReducer } from "react";
 import {
-  FileUp, Save, Download, FilePlus2, Layers, ZoomIn, ZoomOut,
+  FileUp, Save, Download, ZoomIn, ZoomOut,
   Undo2, Redo2, Type, Image, Square, Circle, Minus, ArrowRight,
   Star, Triangle, MousePointer2, ChevronLeft, ChevronRight,
   PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen,
-  Trash2, RotateCw, RotateCcw, Copy, Clipboard, Bold, Italic,
+  Trash2, Bold, Italic,
   Underline, AlignLeft, AlignCenter, AlignRight, Maximize,
-  Minimize2, Menu, X, GripVertical, MoveUp, MoveDown,
-  Settings, FileText, GitMerge, Archive, Eye, EyeOff,
-  Pen, Check, AlertCircle, Loader2, Upload
+  X, GripVertical, MoveUp, MoveDown,
+  FileText, GitMerge, Archive,
+  Check, CircleAlert, Loader2, Upload
 } from "lucide-react";
 
 /* ─── Constants ─── */
@@ -292,6 +292,23 @@ export default function MiniAcrobat() {
     reader.onload = () => openPDF(reader.result, f.name);
     reader.readAsArrayBuffer(f);
     e.target.value = "";
+  }, [openPDF]);
+
+  /* ─── Drag & Drop ─── */
+  const handleDragOver = useCallback((e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
+  const handleDrop = useCallback((e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const f = e.dataTransfer?.files?.[0];
+    if (f && f.type === "application/pdf") {
+      const reader = new FileReader();
+      reader.onload = () => openPDF(reader.result, f.name);
+      reader.readAsArrayBuffer(f);
+    }
   }, [openPDF]);
 
   /* ─── Render Page ─── */
@@ -934,7 +951,7 @@ export default function MiniAcrobat() {
     return (
       <div className="h-screen w-full flex items-center justify-center" style={{ background: "#121220" }}>
         <div className="text-center max-w-md">
-          <AlertCircle className="mx-auto mb-3 text-red-400" size={36} />
+          <CircleAlert className="mx-auto mb-3 text-red-400" size={36} />
           <div className="text-red-400 text-sm mb-2">{error}</div>
           <button onClick={() => setError(null)} className="px-4 py-1.5 bg-blue-600 text-white rounded text-sm">OK</button>
         </div>
@@ -951,7 +968,7 @@ export default function MiniAcrobat() {
           <FileText size={18} className="text-blue-500" />
           <span className="text-sm font-semibold tracking-wide">Mini Acrobat</span>
         </div>
-        <div className="flex-1 flex items-center justify-center">
+        <div className="flex-1 flex items-center justify-center" onDragOver={handleDragOver} onDrop={handleDrop}>
           <div className="text-center max-w-md">
             <div className="w-20 h-20 mx-auto mb-6 rounded-2xl flex items-center justify-center" style={{ background: "linear-gradient(135deg, #0066ff22, #9933ff22)", border: "1px solid #333" }}>
               <FileUp size={36} className="text-blue-400" />
@@ -1131,7 +1148,8 @@ export default function MiniAcrobat() {
 
         {/* ── Canvas Area ── */}
         <div ref={containerRef} className="flex-1 overflow-auto flex items-start justify-center p-6" style={{ background: "#0d0d1a" }}
-          onClick={(e) => { if (e.target === containerRef.current) dispatch({ type: "SET_SELECTION", selection: new Set() }); }}>
+          onClick={(e) => { if (e.target === containerRef.current) dispatch({ type: "SET_SELECTION", selection: new Set() }); }}
+          onDragOver={handleDragOver} onDrop={handleDrop}>
           <div className="relative shadow-2xl" style={{ width: canvasDims.width || "auto", height: canvasDims.height || "auto" }}>
             <canvas ref={canvasRef} style={{ display: "block" }} />
             {/* Annotation Overlay */}
@@ -1176,7 +1194,7 @@ export default function MiniAcrobat() {
       {showMerge && <MergeModal />}
       {error && pdfDoc && (
         <div className="fixed bottom-12 left-1/2 -translate-x-1/2 z-[9999] px-4 py-2 rounded-lg text-sm flex items-center gap-2" style={{ background: "#ff333322", border: "1px solid #ff3333", color: "#ff6666" }}>
-          <AlertCircle size={14} />{error}
+          <CircleAlert size={14} />{error}
           <button onClick={() => setError(null)} className="ml-2 text-gray-400 hover:text-white"><X size={14} /></button>
         </div>
       )}
