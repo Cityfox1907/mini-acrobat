@@ -724,20 +724,55 @@ export default function MiniAcrobat() {
     try {
       const { PDFDocument } = libs.pdfLib;
       const merged = await PDFDocument.create();
-      // Cache loaded documents
       const docCache = new Map();
 
+      // Determine target page size from the first page
+      const firstPg = mergePages[0];
+      let firstSrcDoc;
+      if (docCache.has(firstPg.data)) {
+        firstSrcDoc = docCache.get(firstPg.data);
+      } else {
+        firstSrcDoc = await PDFDocument.load(firstPg.data, { ignoreEncryption: true });
+        docCache.set(firstPg.data, firstSrcDoc);
+      }
+      const firstSrcPage = firstSrcDoc.getPage(firstPg.pageNum - 1);
+      const targetW = firstSrcPage.getWidth();
+      const targetH = firstSrcPage.getHeight();
+
       for (const pg of mergePages) {
-        const key = pg.data;
         let srcDoc;
-        if (docCache.has(key)) {
-          srcDoc = docCache.get(key);
+        if (docCache.has(pg.data)) {
+          srcDoc = docCache.get(pg.data);
         } else {
           srcDoc = await PDFDocument.load(pg.data, { ignoreEncryption: true });
-          docCache.set(key, srcDoc);
+          docCache.set(pg.data, srcDoc);
         }
-        const [copiedPage] = await merged.copyPages(srcDoc, [pg.pageNum - 1]);
-        merged.addPage(copiedPage);
+
+        const srcPage = srcDoc.getPage(pg.pageNum - 1);
+        const srcW = srcPage.getWidth();
+        const srcH = srcPage.getHeight();
+
+        // If page size matches target, just copy directly
+        if (Math.abs(srcW - targetW) < 1 && Math.abs(srcH - targetH) < 1) {
+          const [copiedPage] = await merged.copyPages(srcDoc, [pg.pageNum - 1]);
+          merged.addPage(copiedPage);
+        } else {
+          // Scale page to fit target size while preserving aspect ratio
+          const newPage = merged.addPage([targetW, targetH]);
+          const embeddedPage = await merged.embedPage(srcPage);
+          const scaleX = targetW / srcW;
+          const scaleY = targetH / srcH;
+          const scale = Math.min(scaleX, scaleY);
+          const scaledW = srcW * scale;
+          const scaledH = srcH * scale;
+          // Center the scaled page
+          const offsetX = (targetW - scaledW) / 2;
+          const offsetY = (targetH - scaledH) / 2;
+          newPage.drawPage(embeddedPage, {
+            x: offsetX, y: offsetY,
+            width: scaledW, height: scaledH
+          });
+        }
       }
 
       const bytes = await merged.save();
