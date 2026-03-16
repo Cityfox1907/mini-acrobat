@@ -726,19 +726,9 @@ export default function MiniAcrobat() {
       const merged = await PDFDocument.create();
       const docCache = new Map();
 
-      // Determine target page size from the first page
-      const firstPg = mergePages[0];
-      let firstSrcDoc;
-      if (docCache.has(firstPg.data)) {
-        firstSrcDoc = docCache.get(firstPg.data);
-      } else {
-        firstSrcDoc = await PDFDocument.load(firstPg.data, { ignoreEncryption: true });
-        docCache.set(firstPg.data, firstSrcDoc);
-      }
-      const firstSrcPage = firstSrcDoc.getPage(firstPg.pageNum - 1);
-      const targetW = firstSrcPage.getWidth();
-      const targetH = firstSrcPage.getHeight();
-
+      // First pass: collect all page sizes to determine target
+      // Use the most common width (for portrait) as target, or A4 as fallback
+      const pageSizes = [];
       for (const pg of mergePages) {
         let srcDoc;
         if (docCache.has(pg.data)) {
@@ -747,31 +737,49 @@ export default function MiniAcrobat() {
           srcDoc = await PDFDocument.load(pg.data, { ignoreEncryption: true });
           docCache.set(pg.data, srcDoc);
         }
-
         const srcPage = srcDoc.getPage(pg.pageNum - 1);
-        const srcW = srcPage.getWidth();
-        const srcH = srcPage.getHeight();
+        pageSizes.push({ w: srcPage.getWidth(), h: srcPage.getHeight() });
+      }
 
-        // If page size matches target, just copy directly
-        if (Math.abs(srcW - targetW) < 1 && Math.abs(srcH - targetH) < 1) {
-          const [copiedPage] = await merged.copyPages(srcDoc, [pg.pageNum - 1]);
-          merged.addPage(copiedPage);
-        } else {
-          // Scale page to fit target size while preserving aspect ratio
-          const newPage = merged.addPage([targetW, targetH]);
-          const embeddedPage = await merged.embedPage(srcPage);
+      // Find the largest page width and height to use as target
+      // This ensures no page loses quality by being scaled up
+      const maxW = Math.max(...pageSizes.map(s => s.w));
+      const maxH = Math.max(...pageSizes.map(s => s.h));
+      // Use A4 (595.28 x 841.89) as minimum target if all pages are tiny
+      const targetW = Math.max(maxW, 595.28);
+      const targetH = Math.max(maxH, 841.89);
+
+      // Second pass: copy pages and normalize sizes
+      for (let i = 0; i < mergePages.length; i++) {
+        const pg = mergePages[i];
+        const srcDoc = docCache.get(pg.data);
+        const [copiedPage] = await merged.copyPages(srcDoc, [pg.pageNum - 1]);
+        merged.addPage(copiedPage);
+
+        const srcW = pageSizes[i].w;
+        const srcH = pageSizes[i].h;
+
+        // Scale and resize if dimensions differ from target
+        if (Math.abs(srcW - targetW) > 1 || Math.abs(srcH - targetH) > 1) {
           const scaleX = targetW / srcW;
           const scaleY = targetH / srcH;
+          // Use uniform scale to preserve aspect ratio
           const scale = Math.min(scaleX, scaleY);
+
+          // Scale the page content
+          copiedPage.scaleContent(scale, scale);
+
+          // Set new page size to target
+          copiedPage.setSize(targetW, targetH);
+
+          // Center the content on the page
           const scaledW = srcW * scale;
           const scaledH = srcH * scale;
-          // Center the scaled page
           const offsetX = (targetW - scaledW) / 2;
           const offsetY = (targetH - scaledH) / 2;
-          newPage.drawPage(embeddedPage, {
-            x: offsetX, y: offsetY,
-            width: scaledW, height: scaledH
-          });
+          if (offsetX > 0.5 || offsetY > 0.5) {
+            copiedPage.translateContent(offsetX, offsetY);
+          }
         }
       }
 
