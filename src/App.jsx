@@ -8,7 +8,7 @@ import {
   Underline, AlignLeft, AlignCenter, AlignRight, Maximize,
   X, GripVertical, MoveUp, MoveDown,
   FileText, GitMerge, Archive,
-  Check, CircleAlert, Loader2, Upload
+  Check, CircleAlert, Loader2, Upload, ArrowUp, ArrowDown
 } from "lucide-react";
 
 /* ─── Constants ─── */
@@ -67,7 +67,7 @@ const initialState = {
   annotations: {}, selection: new Set(), clipboard: [],
   history: { past: [], future: [] },
   ui: { sidebarOpen: true, propsOpen: false, mergeMode: false, compressResult: null },
-  mergeFiles: [], editingTextId: null
+  mergeFiles: [], mergePages: [], editingTextId: null
 };
 
 function cloneAnns(anns) {
@@ -111,14 +111,14 @@ function reducer(state, action) {
       const history = pushHistory(state);
       const pg = state.currentPage;
       const anns = { ...state.annotations, [pg]: (state.annotations[pg] || []).filter(a => !state.selection.has(a.id)) };
-      return { ...state, annotations: anns, selection: new Set(), history, editingTextId: null, ui: { ...state.ui, propsOpen: false } };
+      return { ...state, annotations: anns, selection: new Set(), history, editingTextId: null };
     }
     case "SET_SELECTION":
-      return { ...state, selection: action.selection, editingTextId: null, ui: { ...state.ui, propsOpen: action.selection.size > 0 } };
+      return { ...state, selection: action.selection, editingTextId: null, ui: { ...state.ui, propsOpen: action.selection.size > 0 ? true : state.ui.propsOpen } };
     case "TOGGLE_SELECTION": {
       const s = new Set(state.selection);
       if (s.has(action.id)) s.delete(action.id); else s.add(action.id);
-      return { ...state, selection: s, ui: { ...state.ui, propsOpen: s.size > 0 } };
+      return { ...state, selection: s, ui: { ...state.ui, propsOpen: s.size > 0 ? true : state.ui.propsOpen } };
     }
     case "UNDO": {
       if (state.history.past.length === 0) return state;
@@ -140,6 +140,8 @@ function reducer(state, action) {
       return { ...state, ui: { ...state.ui, ...action.ui } };
     case "SET_MERGE_FILES":
       return { ...state, mergeFiles: action.files };
+    case "SET_MERGE_PAGES":
+      return { ...state, mergePages: action.pages };
     case "SET_ANNOTATIONS":
       return { ...state, annotations: action.annotations };
     case "MOVE_ANNOTATION_Z": {
@@ -224,6 +226,9 @@ export default function MiniAcrobat() {
   const [showMerge, setShowMerge] = useState(false);
   const [compressing, setCompressing] = useState(false);
   const [merging, setMerging] = useState(false);
+  const [mergeThumbnails, setMergeThumbnails] = useState({});
+  const [loadingMergePages, setLoadingMergePages] = useState(false);
+  const [dragMergeIdx, setDragMergeIdx] = useState(null);
   const [saving, setSaving] = useState(false);
 
   const canvasRef = useRef(null);
@@ -234,7 +239,7 @@ export default function MiniAcrobat() {
   const mergeInputRef = useRef(null);
   const renderTaskRef = useRef(null);
 
-  const { file, pdfBytes, pageCount, currentPage, zoom, tool, annotations, selection, ui, editingTextId, mergeFiles } = state;
+  const { file, pdfBytes, pageCount, currentPage, zoom, tool, annotations, selection, ui, editingTextId, mergeFiles, mergePages } = state;
   const currentAnnotations = annotations[currentPage] || [];
   const selectedAnnotation = currentAnnotations.find(a => selection.has(a.id));
 
@@ -364,6 +369,21 @@ export default function MiniAcrobat() {
     })();
     return () => { cancelled = true; };
   }, [pdfDoc, pageCount, ui.sidebarOpen]);
+
+  /* ─── Pinch-to-Zoom (Trackpad) ─── */
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const handleWheel = (e) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        const delta = -e.deltaY * 0.01;
+        dispatch({ type: "SET_ZOOM", zoom: zoom + delta });
+      }
+    };
+    container.addEventListener("wheel", handleWheel, { passive: false });
+    return () => container.removeEventListener("wheel", handleWheel);
+  }, [zoom]);
 
   /* ─── Keyboard Shortcuts ─── */
   useEffect(() => {
@@ -615,43 +635,121 @@ export default function MiniAcrobat() {
   }, [libs, pdfBytes]);
 
   /* ─── Merge ─── */
-  const handleMergeFiles = useCallback((e) => {
+  const generateMergeThumbnails = useCallback(async (pages) => {
+    if (!libs.pdfjs) return;
+    for (const pg of pages) {
+      if (mergeThumbnails[pg.id]) continue;
+      try {
+        const doc = await libs.pdfjs.getDocument({ data: pg.data.slice() }).promise;
+        const page = await doc.getPage(pg.pageNum);
+        const vp = page.getViewport({ scale: 0.25 });
+        const c = document.createElement("canvas");
+        c.width = vp.width; c.height = vp.height;
+        await page.render({ canvasContext: c.getContext("2d"), viewport: vp }).promise;
+        setMergeThumbnails(prev => ({ ...prev, [pg.id]: c.toDataURL() }));
+        doc.destroy();
+      } catch { /* skip */ }
+    }
+  }, [libs.pdfjs, mergeThumbnails]);
+
+  const handleMergeFiles = useCallback(async (e) => {
     const files = Array.from(e.target.files || []);
     if (files.length === 0) return;
-    const promises = files.map(f => new Promise((res) => {
+    setLoadingMergePages(true);
+    setShowMerge(true);
+
+    const fileDataList = await Promise.all(files.map(f => new Promise((res) => {
       const reader = new FileReader();
       reader.onload = () => res({ name: f.name, data: new Uint8Array(reader.result) });
       reader.readAsArrayBuffer(f);
-    }));
-    Promise.all(promises).then(results => {
-      dispatch({ type: "SET_MERGE_FILES", files: [...mergeFiles, ...results] });
-      setShowMerge(true);
-    });
+    })));
+
+    dispatch({ type: "SET_MERGE_FILES", files: [...mergeFiles, ...fileDataList] });
+
+    // Extract individual pages
+    const newPages = [];
+    const allSources = [];
+    if (pdfBytes && mergePages.length === 0) {
+      allSources.push({ name: file?.name || "current.pdf", data: pdfBytes });
+    }
+    allSources.push(...fileDataList);
+
+    for (const src of allSources) {
+      try {
+        const { PDFDocument } = libs.pdfLib;
+        const srcDoc = await PDFDocument.load(src.data, { ignoreEncryption: true });
+        const count = srcDoc.getPageCount();
+        for (let i = 0; i < count; i++) {
+          newPages.push({
+            id: `mp_${Date.now()}_${++_idCounter}`,
+            fileName: src.name,
+            pageNum: i + 1,
+            totalPages: count,
+            data: src.data
+          });
+        }
+      } catch { /* skip invalid */ }
+    }
+
+    const allPages = [...mergePages, ...newPages];
+    dispatch({ type: "SET_MERGE_PAGES", pages: allPages });
+    setLoadingMergePages(false);
+
+    // Generate thumbnails in background
+    generateMergeThumbnails(allPages);
     e.target.value = "";
-  }, [mergeFiles]);
+  }, [mergeFiles, mergePages, pdfBytes, file, libs.pdfLib, libs.pdfjs, generateMergeThumbnails]);
+
+  // Generate thumbnails when merge pages change
+  useEffect(() => {
+    if (mergePages.length > 0) generateMergeThumbnails(mergePages);
+  }, [mergePages, generateMergeThumbnails]);
+
+  const moveMergePage = useCallback((fromIdx, toIdx) => {
+    if (toIdx < 0 || toIdx >= mergePages.length) return;
+    const pages = [...mergePages];
+    const [moved] = pages.splice(fromIdx, 1);
+    pages.splice(toIdx, 0, moved);
+    dispatch({ type: "SET_MERGE_PAGES", pages });
+  }, [mergePages]);
+
+  const removeMergePage = useCallback((idx) => {
+    const pages = mergePages.filter((_, i) => i !== idx);
+    dispatch({ type: "SET_MERGE_PAGES", pages });
+  }, [mergePages]);
 
   const executeMerge = useCallback(async () => {
-    if (!libs.pdfLib || mergeFiles.length === 0) return;
+    if (!libs.pdfLib || mergePages.length === 0) return;
     setMerging(true);
     try {
       const { PDFDocument } = libs.pdfLib;
       const merged = await PDFDocument.create();
-      const sources = pdfBytes ? [{ name: file?.name || "current.pdf", data: pdfBytes }, ...mergeFiles] : mergeFiles;
-      for (const src of sources) {
-        try {
-          const srcDoc = await PDFDocument.load(src.data, { ignoreEncryption: true });
-          const pages = await merged.copyPages(srcDoc, srcDoc.getPageIndices());
-          pages.forEach(p => merged.addPage(p));
-        } catch { /* skip invalid */ }
+      // Cache loaded documents
+      const docCache = new Map();
+
+      for (const pg of mergePages) {
+        const key = pg.data;
+        let srcDoc;
+        if (docCache.has(key)) {
+          srcDoc = docCache.get(key);
+        } else {
+          srcDoc = await PDFDocument.load(pg.data, { ignoreEncryption: true });
+          docCache.set(key, srcDoc);
+        }
+        const [copiedPage] = await merged.copyPages(srcDoc, [pg.pageNum - 1]);
+        merged.addPage(copiedPage);
       }
+
       const bytes = await merged.save();
       await openPDF(bytes.buffer, "merged.pdf");
       setShowMerge(false);
       dispatch({ type: "SET_MERGE_FILES", files: [] });
+      dispatch({ type: "SET_MERGE_PAGES", pages: [] });
+      setMergeThumbnails({});
     } catch (e) {
       setError("Zusammenführung fehlgeschlagen: " + e.message);
     } finally { setMerging(false); }
-  }, [libs.pdfLib, mergeFiles, pdfBytes, file, openPDF]);
+  }, [libs.pdfLib, mergePages, openPDF]);
 
   /* ─── Helpers ─── */
   function hexToRgb(hex) {
@@ -719,12 +817,24 @@ export default function MiniAcrobat() {
     if (ann.type === "text") {
       return (
         <div key={ann.id} style={{ ...style, ...selectionBox, minHeight: 20 }}
-          onMouseDown={(e) => { if (!isEditing) handleAnnotationMouseDown(e, ann, "move"); }}
+          onMouseDown={(e) => {
+            if (!isEditing) {
+              if (isSelected && tool === TOOLS.SELECT) {
+                // Already selected - enter edit mode on click
+                e.stopPropagation();
+                e.preventDefault();
+                dispatch({ type: "SET_EDITING_TEXT", id: ann.id });
+              } else {
+                handleAnnotationMouseDown(e, ann, "move");
+              }
+            }
+          }}
           onDoubleClick={(e) => { e.stopPropagation(); dispatch({ type: "SET_EDITING_TEXT", id: ann.id }); dispatch({ type: "SET_SELECTION", selection: new Set([ann.id]) }); }}
         >
           {isEditing ? (
             <textarea
               autoFocus
+              ref={(el) => { if (el && ann.text === "Text eingeben") { el.select(); } }}
               value={ann.text}
               onChange={(e) => dispatch({ type: "UPDATE_ANNOTATION", id: ann.id, changes: { text: e.target.value }, noHistory: true })}
               onBlur={() => dispatch({ type: "SET_EDITING_TEXT", id: null })}
@@ -1001,36 +1111,101 @@ export default function MiniAcrobat() {
 
   /* ─── Merge Modal ─── */
   function MergeModal() {
+    const handleDragStartMerge = (e, idx) => {
+      setDragMergeIdx(idx);
+      e.dataTransfer.effectAllowed = "move";
+    };
+    const handleDragOverMerge = (e, idx) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+    };
+    const handleDropMerge = (e, toIdx) => {
+      e.preventDefault();
+      if (dragMergeIdx !== null && dragMergeIdx !== toIdx) {
+        moveMergePage(dragMergeIdx, toIdx);
+      }
+      setDragMergeIdx(null);
+    };
+
     return (
-      <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60" onClick={() => setShowMerge(false)}>
-        <div className="rounded-xl p-5 w-[480px] max-h-[80vh] overflow-y-auto" style={{ background: "#1e1e2e", border: "1px solid #333" }} onClick={e => e.stopPropagation()}>
+      <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60" onClick={() => { setShowMerge(false); setDragMergeIdx(null); }}>
+        <div className="rounded-xl p-5 w-[600px] max-h-[85vh] flex flex-col" style={{ background: "#1e1e2e", border: "1px solid #333" }} onClick={e => e.stopPropagation()}>
           <div className="flex items-center justify-between mb-4">
             <h3 className="font-semibold text-gray-200">PDFs zusammenführen</h3>
-            <button onClick={() => setShowMerge(false)} className="text-gray-500 hover:text-gray-300"><X size={18} /></button>
+            <div className="flex items-center gap-2">
+              {mergePages.length > 0 && <span className="text-xs text-gray-500">{mergePages.length} Seiten</span>}
+              <button onClick={() => { setShowMerge(false); setDragMergeIdx(null); }} className="text-gray-500 hover:text-gray-300"><X size={18} /></button>
+            </div>
           </div>
-          {mergeFiles.length === 0 && !pdfBytes ? (
+
+          {mergePages.length === 0 && !loadingMergePages ? (
             <div className="text-center py-8">
-              <p className="text-gray-500 text-sm mb-3">Noch keine Dateien ausgewählt.</p>
+              <p className="text-gray-500 text-sm mb-3">Füge PDF-Dateien hinzu, um deren Seiten zusammenzuführen.</p>
+              <p className="text-gray-600 text-xs mb-4">Du kannst die Reihenfolge der Seiten per Drag & Drop ändern und einzelne Seiten entfernen.</p>
               <button onClick={() => mergeInputRef.current?.click()} className="px-4 py-2 bg-blue-600 text-white text-sm rounded-lg">Dateien hinzufügen</button>
             </div>
           ) : (
             <>
-              <div className="space-y-2 mb-4">
-                {pdfBytes && <div className="flex items-center gap-2 px-3 py-2 rounded-lg" style={{ background: "#262640" }}><FileText size={14} className="text-blue-400" /><span className="text-sm text-gray-300 flex-1">{file?.name || "Aktuell geöffnet"}</span><span className="text-[10px] text-gray-500">{formatSize(pdfBytes.length)}</span></div>}
-                {mergeFiles.map((f, i) => (
-                  <div key={i} className="flex items-center gap-2 px-3 py-2 rounded-lg" style={{ background: "#262640" }}>
-                    <GripVertical size={14} className="text-gray-600" />
-                    <FileText size={14} className="text-blue-400" />
-                    <span className="text-sm text-gray-300 flex-1">{f.name}</span>
-                    <span className="text-[10px] text-gray-500">{formatSize(f.data.length)}</span>
-                    <button onClick={() => dispatch({ type: "SET_MERGE_FILES", files: mergeFiles.filter((_, j) => j !== i) })} className="text-gray-600 hover:text-red-400"><X size={14} /></button>
-                  </div>
-                ))}
+              {loadingMergePages && (
+                <div className="flex items-center gap-2 mb-3 text-sm text-gray-400">
+                  <Loader2 className="animate-spin" size={14} /> Seiten werden geladen...
+                </div>
+              )}
+              <div className="overflow-y-auto flex-1 mb-4" style={{ maxHeight: "calc(85vh - 180px)" }}>
+                <div className="grid grid-cols-4 gap-3">
+                  {mergePages.map((pg, idx) => (
+                    <div
+                      key={pg.id}
+                      draggable
+                      onDragStart={(e) => handleDragStartMerge(e, idx)}
+                      onDragOver={(e) => handleDragOverMerge(e, idx)}
+                      onDrop={(e) => handleDropMerge(e, idx)}
+                      onDragEnd={() => setDragMergeIdx(null)}
+                      className={`group relative rounded-lg overflow-hidden cursor-grab active:cursor-grabbing transition-all ${dragMergeIdx === idx ? "opacity-40 scale-95" : "hover:ring-2 hover:ring-blue-500"}`}
+                      style={{ background: "#262640", border: dragMergeIdx !== null && dragMergeIdx !== idx ? "2px dashed #3a3a5e" : "1px solid #3a3a4e" }}
+                    >
+                      {/* Thumbnail */}
+                      <div className="aspect-[3/4] flex items-center justify-center bg-white/5">
+                        {mergeThumbnails[pg.id] ? (
+                          <img src={mergeThumbnails[pg.id]} alt={`Seite ${pg.pageNum}`} className="w-full h-full object-contain" />
+                        ) : (
+                          <Loader2 className="animate-spin text-gray-600" size={16} />
+                        )}
+                      </div>
+                      {/* Page info */}
+                      <div className="px-1.5 py-1 text-center">
+                        <div className="text-[9px] text-gray-500 truncate" title={pg.fileName}>{pg.fileName}</div>
+                        <div className="text-[10px] text-gray-400">S. {pg.pageNum}/{pg.totalPages}</div>
+                      </div>
+                      {/* Controls overlay */}
+                      <div className="absolute top-0 right-0 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col gap-0.5">
+                        <button onClick={(e) => { e.stopPropagation(); removeMergePage(idx); }}
+                          className="p-0.5 rounded bg-red-900/80 text-red-300 hover:bg-red-800" title="Seite entfernen">
+                          <X size={12} />
+                        </button>
+                        <button onClick={(e) => { e.stopPropagation(); moveMergePage(idx, idx - 1); }}
+                          disabled={idx === 0}
+                          className="p-0.5 rounded bg-gray-800/80 text-gray-300 hover:bg-gray-700 disabled:opacity-30" title="Nach vorne">
+                          <ArrowUp size={12} />
+                        </button>
+                        <button onClick={(e) => { e.stopPropagation(); moveMergePage(idx, idx + 1); }}
+                          disabled={idx === mergePages.length - 1}
+                          className="p-0.5 rounded bg-gray-800/80 text-gray-300 hover:bg-gray-700 disabled:opacity-30" title="Nach hinten">
+                          <ArrowDown size={12} />
+                        </button>
+                      </div>
+                      {/* Position badge */}
+                      <div className="absolute top-0 left-0 px-1.5 py-0.5 text-[9px] font-bold text-white bg-blue-600/80 rounded-br">
+                        {idx + 1}
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
               <div className="flex gap-2">
-                <button onClick={() => mergeInputRef.current?.click()} className="flex-1 py-2 text-sm rounded-lg" style={{ background: "#2a2a3e", color: "#aaa" }}>+ Dateien</button>
-                <button onClick={executeMerge} disabled={merging} className="flex-1 py-2 text-sm rounded-lg bg-blue-600 text-white flex items-center justify-center gap-2">
-                  {merging ? <Loader2 className="animate-spin" size={14} /> : <GitMerge size={14} />} Zusammenführen
+                <button onClick={() => mergeInputRef.current?.click()} className="flex-1 py-2 text-sm rounded-lg" style={{ background: "#2a2a3e", color: "#aaa" }}>+ Dateien hinzufügen</button>
+                <button onClick={executeMerge} disabled={merging || mergePages.length === 0} className="flex-1 py-2 text-sm rounded-lg bg-blue-600 text-white flex items-center justify-center gap-2 disabled:opacity-50">
+                  {merging ? <Loader2 className="animate-spin" size={14} /> : <GitMerge size={14} />} Zusammenführen ({mergePages.length} Seiten)
                 </button>
               </div>
             </>
@@ -1077,7 +1252,7 @@ export default function MiniAcrobat() {
         <TBtn icon={FileUp} onClick={() => fileInputRef.current?.click()} tip="Öffnen" shortcut="Ctrl+O" />
         <TBtn icon={Save} onClick={() => setShowSaveDialog(true)} tip="Speichern" shortcut="Ctrl+S" disabled={!pdfDoc} />
         <TBtn icon={Archive} onClick={handleCompress} tip="Komprimieren" disabled={!pdfDoc || compressing} />
-        <TBtn icon={GitMerge} onClick={() => { setShowMerge(true); }} tip="Zusammenführen" />
+        <TBtn icon={GitMerge} onClick={() => { if (!showMerge) { dispatch({ type: "SET_MERGE_PAGES", pages: [] }); dispatch({ type: "SET_MERGE_FILES", files: [] }); setMergeThumbnails({}); } setShowMerge(true); }} tip="Zusammenführen" />
         <div className="w-px h-6 mx-1" style={{ background: "#333" }} />
 
         {/* Tools */}
